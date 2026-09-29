@@ -88,7 +88,9 @@ pref-advanced-title = Advanced
 pref-advanced-help = JSON object whose top-level keys are sent as form fields to docling-serve and override the controls above. Use this for any docling-serve option not exposed elsewhere in this pane. The full schema is documented in the docling-serve OpenAPI surface at /docs on your running server.
 
 pref-disclosure-conversion-collapsed = ▶ Conversion options
+pref-disclosure-conversion-expanded = ▼ Conversion options
 pref-disclosure-advanced-collapsed = ▶ Advanced
+pref-disclosure-advanced-expanded = ▼ Advanced
 
 pref-reset = Reset to defaults
 pref-reset-help = Reverts every zotero-docling preference (including Server URL) to its built-in default.
