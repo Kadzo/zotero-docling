@@ -105,14 +105,14 @@ export function registerPrefsScripts(win: Window): void {
     "zotero-docling-disclosure-conversion",
     "zotero-docling-conversion-section",
     "prefsLayerConversionExpanded",
-    "Conversion options",
+    "pref-disclosure-conversion",
   );
   bindDisclosure(
     win,
     "zotero-docling-disclosure-advanced",
     "zotero-docling-advanced-section",
     "prefsLayerAdvancedExpanded",
-    "Advanced",
+    "pref-disclosure-advanced",
   );
   bindResetButton(win);
 }
@@ -128,7 +128,7 @@ function bindDisclosure(
   buttonId: string,
   sectionId: string,
   prefKey: "prefsLayerConversionExpanded" | "prefsLayerAdvancedExpanded",
-  baseLabel: string,
+  l10nIdBase: string,
 ): void {
   const btn = win.document.getElementById(buttonId) as HTMLElement | null;
   const section = win.document.getElementById(sectionId) as HTMLElement | null;
@@ -136,7 +136,7 @@ function bindDisclosure(
 
   const refresh = (expanded: boolean) => {
     section.hidden = !expanded;
-    btn.textContent = `${expanded ? "▼" : "▶"} ${baseLabel}`;
+    btn.setAttribute("data-l10n-id", `${l10nIdBase}-${expanded ? "expanded" : "collapsed"}`);
   };
 
   const initial = (getPref(prefKey) ?? false) as boolean;
