@@ -4,7 +4,9 @@
 //   - Preset dropdowns "Custom…" entry → reveal a free-text input
 //   - "Reset to defaults" button → confirm + clear every plugin pref
 
+import { getLocaleID } from "../utils/locale";
 import { getPref, setPref } from "../utils/prefs";
+import { FluentMessageId } from "../../typings/i10n";
 import { testServerConnection } from "./convert";
 
 const LOG = "[zotero-docling]";
@@ -105,14 +107,16 @@ export function registerPrefsScripts(win: Window): void {
     "zotero-docling-disclosure-conversion",
     "zotero-docling-conversion-section",
     "prefsLayerConversionExpanded",
-    "pref-disclosure-conversion",
+    "pref-disclosure-conversion-collapsed",
+    "pref-disclosure-conversion-expanded",
   );
   bindDisclosure(
     win,
     "zotero-docling-disclosure-advanced",
     "zotero-docling-advanced-section",
     "prefsLayerAdvancedExpanded",
-    "pref-disclosure-advanced",
+    "pref-disclosure-advanced-collapsed",
+    "pref-disclosure-advanced-expanded",
   );
   bindResetButton(win);
 }
@@ -128,7 +132,8 @@ function bindDisclosure(
   buttonId: string,
   sectionId: string,
   prefKey: "prefsLayerConversionExpanded" | "prefsLayerAdvancedExpanded",
-  l10nIdBase: string,
+  collapsedL10nId: FluentMessageId,
+  expandedL10nId: FluentMessageId,
 ): void {
   const btn = win.document.getElementById(buttonId) as HTMLElement | null;
   const section = win.document.getElementById(sectionId) as HTMLElement | null;
@@ -136,7 +141,12 @@ function bindDisclosure(
 
   const refresh = (expanded: boolean) => {
     section.hidden = !expanded;
-    btn.setAttribute("data-l10n-id", `${l10nIdBase}-${expanded ? "expanded" : "collapsed"}`);
+    // getLocaleID adds the addonRef prefix the build applies to every FTL
+    // message; a bare ID would not resolve and the heading would go blank.
+    btn.setAttribute(
+      "data-l10n-id",
+      getLocaleID(expanded ? expandedL10nId : collapsedL10nId),
+    );
   };
 
   const initial = (getPref(prefKey) ?? false) as boolean;
