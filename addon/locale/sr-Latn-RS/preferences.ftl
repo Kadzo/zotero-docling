@@ -76,7 +76,16 @@ pref-use-async =
     .label = Koristi asinhronu adresu (/v1/convert/file/async)
 pref-async-poll = Razmak između provera (s)
 pref-async-max-wait = Najduže čekanje (min)
-pref-async-max-wait-help = Ograničenje čekanja u dodatku za jedan asinhroni zadatak (podrazumevano 240, najviše 1440; 0 = bez ograničenja). Kada se prekorači, dodatak prestaje da proverava stanje i prijavljuje grešku. docling-serve nema API za otkazivanje pojedinačnog zadatka, pa obrada na serveru može ipak da se završi.
+pref-async-max-wait-help = Ograničenje čekanja u dodatku za jedan asinhroni zadatak (podrazumevano 240, najviše 1440; 0 = bez ograničenja). Kada se prekorači, dodatak prestaje da proverava stanje i prijavljuje grešku. docling-serve nema API za otkazivanje pojedinačnog zadatka, pa obrada na serveru može ipak da se završi u pozadini — postavi 0 ako želiš da dodatak uvek sačeka završetak.
+
+pref-timeouts-title = Vremenska ograničenja
+pref-timeouts-help = Koliko dugo se čeka odgovor servera docling-serve pre odustajanja od zahteva. Zahtev koji prekorači vremensko ograničenje otkazuje se i prijavljuje kao greška, tako da zastoj servera ne blokira obradu grupe.
+pref-health-timeout = Provera veze (s)
+pref-poll-timeout = Provera stanja asinhronog zadatka (s)
+pref-async-upload-timeout = Asinhrono slanje (min)
+pref-async-result-timeout = Preuzimanje asinhronog rezultata (min)
+pref-sync-timeout = Sinhrono pretvaranje (min)
+pref-sync-timeout-help = docling-serve sam prestaje da čeka nakon vremena zadatog opcijom DOCLING_SERVE_MAX_SYNC_WAIT (podrazumevano 120 s). Ako tu vrednost povećaš na serveru, povećaj i ovu — ili uključi asinhronu adresu za dugotrajna pretvaranja.
 pref-advanced-title = Napredno
 pref-advanced-help = JSON objekat čiji se ključevi najvišeg nivoa šalju kao polja obrasca serveru docling-serve i imaju prednost nad gornjim podešavanjima. Koristi ga za opcije koje nisu prikazane ovde. Potpuna šema je u dokumentaciji docling-serve OpenAPI na adresi /docs pokrenutog servera.
 pref-disclosure-conversion-collapsed = ▶ Opcije pretvaranja
@@ -89,4 +98,3 @@ pref-reset-confirm-title = Vratiti podešavanja dodatka zotero-docling?
 pref-reset-confirm-body = Ovo vraća sva podešavanja dodatka (adresu servera, automatsko pretvaranje, postupak obrade, VLM podešavanje, izlaz i ostalo) na ugrađene vrednosti. Tvoja Zotero biblioteka i postojeći Markdown prilozi ostaju netaknuti.
 pref-reset-done = Podešavanja su vraćena na podrazumevane vrednosti
 pref-build-info = { $name } { $version } · izrađeno { $time }
-
