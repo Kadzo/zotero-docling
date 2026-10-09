@@ -6,7 +6,7 @@
 //
 // Verified against docling-serve 1.18.0 on 2026-05.
 
-import { getPref } from "../utils/prefs";
+import { getPref, setPref } from "../utils/prefs";
 import {
   hasMarkdownChild,
   getLocalFilePath,
@@ -56,6 +56,22 @@ function log(...args: unknown[]): void {
  * The `Zotero.Prefs` store is plain text inside the user's profile — surface
  * this in the prefs help and SECURITY.md rather than pretending it's secure.
  */
+/** UTF-8 bytes of a string (lone surrogates become U+FFFD, never a throw). */
+function utf8Bytes(s: string): Uint8Array | number[] {
+  const Encoder = (globalThis as any).TextEncoder;
+  if (Encoder) return new Encoder().encode(s);
+  // Sandbox without TextEncoder: same result via encodeURIComponent.
+  const safe = s.replace(
+    /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g,
+    "\ufffd",
+  );
+  return Array.from(
+    encodeURIComponent(safe).replace(/%([0-9A-F]{2})/g, (_, h) =>
+      String.fromCharCode(parseInt(h, 16)),
+    ),
+  ).map((c) => c.charCodeAt(0));
+}
+
 export function buildAuthHeader(): Record<string, string> {
   const scheme = ((getPref("authScheme") ?? "none") as string).toLowerCase();
   if (scheme === "none" || scheme === "") return {};
@@ -70,12 +86,12 @@ export function buildAuthHeader(): Record<string, string> {
     const user = ((getPref("authUsername") as string) ?? "").trim();
     const pass = (getPref("authSecret") as string) ?? "";
     if (!user && !pass) return {};
-    // Use globalThis.btoa — exposed in Z9's sandbox; fall back to Buffer if
-    // someone runs this under Node tests.
-    const encoded = (
-      (globalThis as any).btoa ??
-      ((s: string) => Buffer.from(s, "binary").toString("base64"))
-    )(`${user}:${pass}`);
+    // Basic auth is base64 of the UTF-8 bytes. btoa() only takes Latin-1, so
+    // non-ASCII credentials (é, €, ...) were mis-encoded or threw outright.
+    const bytes = utf8Bytes(`${user}:${pass}`);
+    let latin1 = "";
+    for (const b of bytes) latin1 += String.fromCharCode(b);
+    const encoded = (globalThis as any).btoa(latin1);
     return { Authorization: `Basic ${encoded}` };
   }
 
@@ -172,6 +188,9 @@ const inFlightItems = new Set<number>();
 
 /** docling-serve response envelope (subset we read). */
 interface ConvertResponse {
+  /** FastAPI request errors (e.g. 422): a message or a list of {msg};
+   *  proxies and custom handlers sometimes send an object. */
+  detail?: unknown;
   document?: {
     filename?: string;
     md_content?: string;
@@ -372,6 +391,19 @@ function formatServerErrors(data: ConvertResponse): string {
   const parts = (data.errors ?? [])
     .map((e) => e?.error_message ?? JSON.stringify(e))
     .filter(Boolean);
+  // Request-level errors (bad option, missing field) come back as FastAPI's
+  // `detail` rather than `errors`.
+  if (parts.length === 0 && data.detail) {
+    const d = data.detail;
+    if (typeof d === "string") parts.push(d);
+    else if (Array.isArray(d)) {
+      parts.push(
+        ...d.map((x) =>
+          typeof x?.msg === "string" ? x.msg : JSON.stringify(x),
+        ),
+      );
+    } else parts.push(JSON.stringify(d));
+  }
   return parts.join(" | ") || `status="${data.status ?? "unknown"}"`;
 }
 
@@ -545,7 +577,12 @@ async function fetchConvertResultAsync(
           headers: authHeaders,
           signal,
         });
-        if (!r.ok) return { label: httpLabelOf(r) };
+        if (!r.ok) {
+          // Include the server's reason (e.g. a 422 for an option set in
+          // Advanced JSON), not just the status line.
+          const outcome = await parseConvertResponse(r);
+          return { label: outcome.ok ? httpLabelOf(r) : outcome.message };
+        }
         return {
           body: (await r.json().catch(() => ({}))) as TaskStatusResponse,
         };
@@ -603,11 +640,29 @@ async function fetchConvertResultAsync(
             headers: authHeaders,
             signal,
           });
-          if (!r.ok) return { ok: false as const, label: httpLabelOf(r) };
-          return {
-            ok: true as const,
-            status: (await r.json().catch(() => ({}))) as TaskStatusResponse,
-          };
+          if (!r.ok) {
+            // 5xx/429 from a proxy or a busy server are usually transient:
+            // throw so the catch below counts a failed poll and keeps going
+            // (bounded by the max-wait ceiling). Other errors (404 = task
+            // unknown) are final.
+            if (r.status >= 500 || r.status === 429) {
+              throw new Error(`Poll ${httpLabelOf(r)}`);
+            }
+            return { ok: false as const, label: httpLabelOf(r) };
+          }
+          const raw = await r.text();
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            parsed = undefined;
+          }
+          // e.g. a proxy's HTML login page, or `null` — used to poll silently
+          // for hours (or crash); now a failed poll.
+          if (!parsed || typeof parsed !== "object") {
+            throw new Error("Poll returned an unexpected (non-JSON) response");
+          }
+          return { ok: true as const, status: parsed as TaskStatusResponse };
         },
         api.AbortController,
       );
@@ -1002,6 +1057,37 @@ export async function preflightServer(): Promise<boolean> {
  * http://host:9292/upstream/docling-serve (issue #44). A query string or
  * fragment is rejected because appending a path after it would break.
  */
+/**
+ * One-time cleanup for servers configured as http://user:pass@host. URL
+ * credentials are now rejected (they were silently dropped before), so move
+ * them into the Basic auth settings — unless another auth scheme is already
+ * set up, in which case keep that and just strip the URL. Without this,
+ * auto-convert for such users would only report "docling-serve isn't
+ * running".
+ */
+export function migrateUrlCredentials(): void {
+  const raw = ((getPref("serverUrl") as string) ?? "").trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return;
+  }
+  if (!parsed.username && !parsed.password) return;
+  const user = decodeURIComponent(parsed.username);
+  const pass = decodeURIComponent(parsed.password);
+  parsed.username = "";
+  parsed.password = "";
+  const scheme = ((getPref("authScheme") as string) ?? "none").toLowerCase();
+  if (scheme === "none" || scheme === "") {
+    setPref("authScheme", "basic");
+    setPref("authUsername", user);
+    setPref("authSecret", pass);
+  }
+  setPref("serverUrl", parsed.toString().replace(/\/+$/, ""));
+  log("moved credentials out of the server URL");
+}
+
 export function normalizeServerUrl(
   raw: string,
 ): { ok: true; url: string } | { ok: false; message: string } {
@@ -1022,6 +1108,13 @@ export function normalizeServerUrl(
     return {
       ok: false,
       message: `Unsupported scheme "${parsed.protocol}" — use http or https`,
+    };
+  }
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      message:
+        "Server URL must not include a username or password — enter them under Authentication instead",
     };
   }
   if (parsed.search || parsed.hash) {
