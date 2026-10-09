@@ -2,7 +2,7 @@ import { assert } from "chai";
 import { config } from "../package.json";
 import hooks from "../src/hooks";
 import { setFetchOverrideForTests } from "../src/modules/convert";
-import { registerMenu, runBatch, unregisterMenu } from "../src/modules/menu";
+import { registerMenus, runBatch } from "../src/modules/menu";
 import {
   attachFocusListeners,
   detachFocusListeners,
@@ -14,18 +14,15 @@ import {
 } from "./_zoteroItems";
 
 // Audit M6/M7: window listeners stacked up on every load and were never
-// removed; menus were registered once at startup, so a main window closed
-// and reopened (macOS) came back without them; one throwing shutdown step
-// skipped the rest; and batches kept converting after shutdown.
-
-const MENU_CONVERT_ID = "zotero-docling-convert";
+// removed; one throwing shutdown step skipped the rest; and batches kept
+// converting after shutdown. (Menus go through Zotero.MenuManager since
+// v0.5.0 — see menuManager.test.ts.)
 
 /** Put the live plugin's own UI back after a test drove the test copy. */
 async function restoreLivePlugin(): Promise<void> {
   const live = (Zotero as any)[config.addonInstance];
   for (const win of Zotero.getMainWindows()) {
-    // Unload first: the live copy remembers it already registered this
-    // window and would otherwise skip re-adding the items we removed.
+    // Re-attach the live copy's window listeners (and Fluent strings).
     await live.hooks.onMainWindowUnload(win);
     await live.hooks.onMainWindowLoad(win);
   }
@@ -64,49 +61,6 @@ describe("lifecycle", function () {
     });
   });
 
-  describe("menus", function () {
-    after(restoreLivePlugin);
-
-    it("come back when the main window is unloaded and loaded again", async function () {
-      const win = Zotero.getMainWindow();
-      await hooks.onMainWindowUnload(win);
-      assert.isNull(win.document.getElementById(MENU_CONVERT_ID));
-
-      await hooks.onMainWindowLoad(win as _ZoteroTypes.MainWindow);
-
-      assert.ok(
-        win.document.getElementById(MENU_CONVERT_ID),
-        "Convert menu item must be registered on window load",
-      );
-    });
-  });
-
-  describe("menus in more than one window", function () {
-    after(restoreLivePlugin);
-
-    it("removing them from one window leaves another window's menus alone", function () {
-      const main = Zotero.getMainWindow();
-      registerMenu(main);
-      const other = {
-        document: main.document.implementation.createHTMLDocument("other"),
-      } as unknown as Window;
-
-      unregisterMenu(other);
-
-      assert.ok(
-        main.document.getElementById(MENU_CONVERT_ID),
-        "the main window's menu item must survive",
-      );
-    });
-
-    it("registering twice for the same window adds each item once", function () {
-      const main = Zotero.getMainWindow();
-      registerMenu(main);
-      registerMenu(main);
-      assert.lengthOf(main.document.querySelectorAll(`#${MENU_CONVERT_ID}`), 1);
-    });
-  });
-
   describe("shutdown", function () {
     let live: any;
 
@@ -119,10 +73,17 @@ describe("lifecycle", function () {
       live.data.alive = true;
       delete live.data.dialog;
       (globalThis as any).addon = live;
+      // Hand the menus back to the live plugin, so later tests (and its own
+      // handlers) use the real build rather than this test copy.
+      live.hooks.registerMenus();
       await restoreLivePlugin();
     });
 
     it("finishes every step even when one of them throws", async function () {
+      // Take over the menus with this test copy (exercises the retry when the
+      // key is still held, as after a hot reload), so its shutdown has
+      // registrations of its own to remove.
+      registerMenus();
       live.data.dialog = {
         window: {
           close() {
@@ -144,6 +105,20 @@ describe("lifecycle", function () {
         "plugin instance must be unregistered",
       );
       assert.isFalse(live.data.alive);
+      const win = Zotero.getMainWindow();
+      const popup = win.document.getElementById("zotero-itemmenu")!;
+      (Zotero as any).MenuManager.updateMenuPopup(popup, "main/library/item", {
+        getContext: () => ({
+          items: [],
+          tabType: "library",
+          tabID: "zotero-pane",
+        }),
+        skipGrouping: true,
+      });
+      assert.isNull(
+        popup.querySelector(`[data-l10n-id="${config.addonRef}-menu-convert"]`),
+        "menus must be unregistered from Zotero.MenuManager",
+      );
     });
   });
 
