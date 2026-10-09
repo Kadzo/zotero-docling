@@ -9,6 +9,7 @@
 // observer returns immediately and nothing happens.
 
 import { getPref } from "../utils/prefs";
+import { releaseBatch, tryAcquireBatch } from "../utils/batchLock";
 import {
   convertAttachment,
   applyStatusTagsToParents,
@@ -82,7 +83,11 @@ const observer = {
 
 async function processPending(): Promise<void> {
   if (processing) {
-    log("processPending: already running, will pick up next debounce tick");
+    // The timer that called us has fired; forget it so the running batch's
+    // finally (below) sees no pending timer and reschedules for the IDs
+    // queued meanwhile. Otherwise they waited for the next import.
+    debounceTimer = null;
+    log("processPending: already running, will reschedule when it ends");
     return;
   }
   processing = true;
@@ -92,9 +97,10 @@ async function processPending(): Promise<void> {
     debounceTimer = null;
     log(`processing ${ids.length} pending PDF(s)`);
 
-    // Defer to a user-initiated batch if one is already running — avoids
-    // two orchestrators stomping on the shared progress window.
-    if (addon.data.batchInFlight) {
+    // Defer to any batch that's already running (menu, Remove Images). The
+    // lock is taken here, synchronously, BEFORE the preflight await — so a
+    // menu click during preflight can't start a second batch (audit M2).
+    if (!tryAcquireBatch("auto-convert")) {
       log("a batch is already running — re-queueing for next debounce tick");
       // Put the IDs back so we'll process them after the current batch ends.
       for (const id of ids) pendingIDs.add(id);
@@ -121,61 +127,63 @@ async function processPending(): Promise<void> {
     // so a future deferral can notify the user again.
     deferredToastShown = false;
 
-    // Pre-flight: if docling-serve is down, skip the whole batch with one
-    // concise toast instead of N "Server not reachable" lines.
-    if (!(await preflightServer())) {
-      log("preflight failed — auto-convert paused until server is up");
-      toast(
-        "Docling auto-convert",
-        `Skipped ${ids.length} PDF${ids.length === 1 ? "" : "s"} — docling-serve isn't running`,
-        false,
-      );
-      return;
-    }
-
-    addon.data.batchInFlight = true;
-
-    const limit = Math.max(
-      1,
-      Math.min(8, Number(getPref("maxConcurrency") ?? 1) || 1),
-    );
-    const limiter = new ConcurrencyLimiter(limit);
-
     let ok = 0;
     let skipped = 0;
     let failed = 0;
     const skipReasons = new Set<string>();
     const failMessages: string[] = [];
+    const warnings: string[] = [];
     const batchResults: Array<{ item: Zotero.Item; result: ConvertResult }> =
       [];
 
-    const runOne = async (id: number): Promise<void> => {
-      const item = Zotero.Items.get(id);
-      if (!item) return;
-      let result: ConvertResult;
-      try {
-        result = await convertAttachment(item);
-      } catch (e) {
-        result = { status: "error", message: (e as Error).message };
-        log(`auto-convert threw for item ${id}: ${(e as Error).message}`);
-      }
-      batchResults.push({ item, result });
-      if (result.status === "ok") ok++;
-      else if (result.status === "skipped") {
-        skipped++;
-        skipReasons.add(result.reason);
-      } else {
-        failed++;
-        failMessages.push(result.message);
-        log(`auto-convert error for item ${id}: ${result.message}`);
-      }
-    };
-
     try {
-      await Promise.all(ids.map((id) => limiter.run(() => runOne(id))));
+      // Pre-flight: if docling-serve is down, skip the whole batch with one
+      // concise toast instead of N "Server not reachable" lines.
+      if (!(await preflightServer())) {
+        log("preflight failed — auto-convert paused until server is up");
+        toast(
+          "Docling auto-convert",
+          `Skipped ${ids.length} PDF${ids.length === 1 ? "" : "s"} — docling-serve isn't running`,
+          false,
+        );
+        return;
+      }
+
+      const limit = Math.max(
+        1,
+        Math.min(8, Number(getPref("maxConcurrency") ?? 1) || 1),
+      );
+      const limiter = new ConcurrencyLimiter(limit);
+
+      const runOne = async (id: number): Promise<void> => {
+        const item = Zotero.Items.get(id);
+        if (!item) return;
+        let result: ConvertResult;
+        try {
+          result = await convertAttachment(item);
+        } catch (e) {
+          result = { status: "error", message: (e as Error).message };
+          log(`auto-convert threw for item ${id}: ${(e as Error).message}`);
+        }
+        batchResults.push({ item, result });
+        if (result.status === "ok") {
+          ok++;
+          if (result.warning) warnings.push(result.warning);
+        } else if (result.status === "skipped") {
+          skipped++;
+          skipReasons.add(result.reason);
+        } else {
+          failed++;
+          failMessages.push(result.message);
+          log(`auto-convert error for item ${id}: ${result.message}`);
+        }
+      };
+
+      // allSettled: hold the lock until every item has finished (audit M3).
+      await Promise.allSettled(ids.map((id) => limiter.run(() => runOne(id))));
       await applyStatusTagsToParents(batchResults);
     } finally {
-      addon.data.batchInFlight = false;
+      releaseBatch();
     }
     if (ok + failed + skipped === 0) return;
 
@@ -191,9 +199,11 @@ async function processPending(): Promise<void> {
     const detail =
       failMessages.length > 0
         ? failMessages.slice(0, 2).join("\n")
-        : skipReasons.size > 0
-          ? Array.from(skipReasons).slice(0, 2).join("\n")
-          : undefined;
+        : warnings.length > 0
+          ? warnings.slice(0, 2).join("\n")
+          : skipReasons.size > 0
+            ? Array.from(skipReasons).slice(0, 2).join("\n")
+            : undefined;
     toast(
       "Docling auto-convert",
       detail ? `${summary}\n${detail}` : summary,

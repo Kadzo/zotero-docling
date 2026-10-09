@@ -11,6 +11,9 @@ import {
   hasMarkdownChild,
   getLocalFilePath,
   isConvertiblePdf,
+  mdNameForPdf,
+  findMatchingMdChild,
+  trashItem,
 } from "../utils/zotero";
 import {
   buildFrontmatter,
@@ -19,6 +22,7 @@ import {
 import { withDbLock } from "../utils/dbLock";
 import { enrichServerError } from "../utils/serverErrorHints";
 import { toast } from "./ui";
+import { RequestTimeoutError, withRequestTimeout } from "../utils/timeout";
 
 const LOG = "[zotero-docling]";
 
@@ -85,6 +89,14 @@ export function buildAuthHeader(): Record<string, string> {
   return {};
 }
 
+// Test seam: in-Zotero tests swap `fetch` for a scripted stand-in for
+// docling-serve so conversion paths can be exercised without a server.
+// Production code never sets this.
+let fetchOverrideForTests: typeof fetch | null = null;
+export function setFetchOverrideForTests(fn: typeof fetch | null): void {
+  fetchOverrideForTests = fn;
+}
+
 /**
  * Z9's plugin sandbox exposes some Web APIs as bare globals (e.g. fetch) but
  * not others (e.g. FormData, Blob). Prefer bare globals when present, fall
@@ -94,6 +106,7 @@ export function getWebApis(): {
   FormData: typeof FormData;
   Blob: typeof Blob;
   fetch: typeof fetch;
+  AbortController?: typeof AbortController;
 } {
   const g = globalThis as any;
   const win =
@@ -102,18 +115,41 @@ export function getWebApis(): {
 
   const FormDataCtor = g.FormData ?? win?.FormData;
   const BlobCtor = g.Blob ?? win?.Blob;
-  const fetchFn = g.fetch ?? (win?.fetch ? win.fetch.bind(win) : undefined);
+  const fetchFn =
+    fetchOverrideForTests ??
+    g.fetch ??
+    (win?.fetch ? win.fetch.bind(win) : undefined);
 
   if (!FormDataCtor || !BlobCtor || !fetchFn) {
     throw new Error(
       `Web API unavailable — FormData=${!!FormDataCtor} Blob=${!!BlobCtor} fetch=${!!fetchFn}`,
     );
   }
-  return { FormData: FormDataCtor, Blob: BlobCtor, fetch: fetchFn };
+  // Take AbortController from the same realm as fetch: a signal from one
+  // realm isn't guaranteed to be honoured by a fetch from another.
+  // (A test override runs in this realm too.) If the fetch's realm has no
+  // AbortController we fall back to the other realm's; the timeout race still
+  // rejects on time, but the underlying request may then not be cancelled.
+  const fetchIsLocal = !!(fetchOverrideForTests || g.fetch);
+  const AbortCtor = fetchIsLocal
+    ? (g.AbortController ?? win?.AbortController)
+    : (win?.AbortController ?? g.AbortController);
+  return {
+    FormData: FormDataCtor,
+    Blob: BlobCtor,
+    fetch: fetchFn,
+    AbortController: AbortCtor,
+  };
 }
 
 export type ConvertResult =
-  | { status: "ok"; attachmentID: number; processingTimeSec?: number }
+  | {
+      status: "ok";
+      attachmentID: number;
+      processingTimeSec?: number;
+      /** Set when the .md was attached but a secondary output failed. */
+      warning?: string;
+    }
   | { status: "skipped"; reason: string }
   | { status: "error"; message: string };
 
@@ -124,7 +160,7 @@ export type ConvertResult =
  * duplicate — otherwise docling-serve happily processes both and we end
  * up with two .md siblings.
  *
- * Why this exists alongside `addon.data.batchInFlight`: the batch flag
+ * Why this exists alongside the batch lock (utils/batchLock.ts): the lock
  * prevents two batches starting simultaneously at the orchestrator level
  * (one click → one batch). This per-item set provides defence-in-depth
  * against future call paths that bypass the batch orchestrator and call
@@ -362,6 +398,38 @@ function httpLabelOf(r: Response): string {
   return r.statusText ? `HTTP ${r.status} ${r.statusText}` : `HTTP ${r.status}`;
 }
 
+/**
+ * Read a timeout pref as milliseconds. Non-numeric or non-positive values
+ * fall back to the shipped default rather than disabling the timeout.
+ */
+function timeoutMs(
+  key:
+    | "healthTimeoutSec"
+    | "pollTimeoutSec"
+    | "asyncUploadTimeoutMin"
+    | "asyncResultTimeoutMin"
+    | "syncTimeoutMin",
+  fallback: number,
+): number {
+  const n = Number(getPref(key));
+  const value = Number.isFinite(n) && n > 0 ? n : fallback;
+  // setTimeout treats anything above 2^31-1 ms (~24.8 days) as 0, which
+  // would make every request "time out" at once.
+  return Math.min(value * (key.endsWith("Sec") ? 1000 : 60_000), 2_147_483_647);
+}
+
+/** User-facing message for a failed request: timeout vs. unreachable. */
+function requestFailureMessage(
+  e: unknown,
+  what: string,
+  settingLabel: string,
+): string {
+  if (e instanceof RequestTimeoutError) {
+    return `${e.message} ${what} (Settings → Advanced → Timeouts → ${settingLabel})`;
+  }
+  return "Server not reachable";
+}
+
 /** Parse a response as JSON. On non-2xx with no JSON body, return the HTTP label. */
 async function parseConvertResponse(r: Response): Promise<FetchOutcome> {
   const label = httpLabelOf(r);
@@ -392,18 +460,31 @@ async function fetchConvertResultSync(
   form: FormData,
   api: ReturnType<typeof getWebApis>,
 ): Promise<FetchOutcome> {
-  let response: Response;
   try {
-    response = await api.fetch(`${serverUrl}/v1/convert/file`, {
-      method: "POST",
-      body: form,
-      headers: buildAuthHeader(),
-    });
+    return await withRequestTimeout(
+      timeoutMs("syncTimeoutMin", 10),
+      async (signal) => {
+        const response = await api.fetch(`${serverUrl}/v1/convert/file`, {
+          method: "POST",
+          body: form,
+          headers: buildAuthHeader(),
+          signal,
+        });
+        return parseConvertResponse(response);
+      },
+      api.AbortController,
+    );
   } catch (e) {
     Zotero.debug(`${LOG} sync fetch failed: ${(e as Error).message}`);
-    return { ok: false, message: "Server not reachable" };
+    return {
+      ok: false,
+      message: requestFailureMessage(
+        e,
+        "waiting for the conversion",
+        "Sync conversion",
+      ),
+    };
   }
-  return parseConvertResponse(response);
 }
 
 /** Plain sleep — no abort plumbing (see file header note on cancel). */
@@ -435,23 +516,35 @@ async function fetchConvertResultAsync(
 
   // 1. Submit
   const authHeaders = buildAuthHeader();
-  let submitResp: Response;
+  let submitBody: TaskStatusResponse;
   try {
-    submitResp = await api.fetch(`${serverUrl}/v1/convert/file/async`, {
-      method: "POST",
-      body: form,
-      headers: authHeaders,
-    });
+    const submitted = await withRequestTimeout(
+      timeoutMs("asyncUploadTimeoutMin", 5),
+      async (signal) => {
+        const r = await api.fetch(`${serverUrl}/v1/convert/file/async`, {
+          method: "POST",
+          body: form,
+          headers: authHeaders,
+          signal,
+        });
+        if (!r.ok) return { label: httpLabelOf(r) };
+        return {
+          body: (await r.json().catch(() => ({}))) as TaskStatusResponse,
+        };
+      },
+      api.AbortController,
+    );
+    if ("label" in submitted) {
+      return { ok: false, message: `Submit ${submitted.label}` };
+    }
+    submitBody = submitted.body;
   } catch (e) {
     Zotero.debug(`${LOG} async submit failed: ${(e as Error).message}`);
-    return { ok: false, message: "Server not reachable" };
+    return {
+      ok: false,
+      message: requestFailureMessage(e, "uploading the PDF", "Async upload"),
+    };
   }
-  if (!submitResp.ok) {
-    return { ok: false, message: `Submit ${httpLabelOf(submitResp)}` };
-  }
-  const submitBody = (await submitResp
-    .json()
-    .catch(() => ({}))) as TaskStatusResponse;
   const taskId = submitBody.task_id;
   if (!taskId) {
     return { ok: false, message: "Async submit returned no task_id" };
@@ -482,13 +575,27 @@ async function fetchConvertResultAsync(
       };
     }
 
-    let pollResp: Response;
+    let poll:
+      { ok: false; label: string } | { ok: true; status: TaskStatusResponse };
     try {
-      pollResp = await api.fetch(`${serverUrl}/v1/status/poll/${taskId}`, {
-        headers: authHeaders,
-      });
+      poll = await withRequestTimeout(
+        timeoutMs("pollTimeoutSec", 30),
+        async (signal) => {
+          const r = await api.fetch(`${serverUrl}/v1/status/poll/${taskId}`, {
+            headers: authHeaders,
+            signal,
+          });
+          if (!r.ok) return { ok: false as const, label: httpLabelOf(r) };
+          return {
+            ok: true as const,
+            status: (await r.json().catch(() => ({}))) as TaskStatusResponse,
+          };
+        },
+        api.AbortController,
+      );
       consecutiveFailures = 0;
     } catch (e) {
+      // A poll that times out counts as one failed poll, like a network blip.
       consecutiveFailures++;
       Zotero.debug(
         `${LOG} async poll failed (${consecutiveFailures} consecutive): ${(e as Error).message}`,
@@ -514,12 +621,10 @@ async function fetchConvertResultAsync(
       // recover within a few seconds.
       continue;
     }
-    if (!pollResp.ok) {
-      return { ok: false, message: `Poll ${httpLabelOf(pollResp)}` };
+    if (!poll.ok) {
+      return { ok: false, message: `Poll ${poll.label}` };
     }
-    const status = (await pollResp
-      .json()
-      .catch(() => ({}))) as TaskStatusResponse;
+    const status = poll.status;
     const s = status.task_status;
     if (s === "success" || s === "partial_success") break;
     if (s === "failure") {
@@ -537,16 +642,32 @@ async function fetchConvertResultAsync(
   }
 
   // 3. Fetch result
-  let resultResp: Response;
   try {
-    resultResp = await api.fetch(`${serverUrl}/v1/result/${taskId}`, {
-      headers: authHeaders,
-    });
+    return await withRequestTimeout(
+      timeoutMs("asyncResultTimeoutMin", 10),
+      async (signal) => {
+        const r = await api.fetch(`${serverUrl}/v1/result/${taskId}`, {
+          headers: authHeaders,
+          signal,
+        });
+        return parseConvertResponse(r);
+      },
+      api.AbortController,
+    );
   } catch (e) {
     Zotero.debug(`${LOG} async result fetch failed: ${(e as Error).message}`);
-    return { ok: false, message: "Server not reachable while fetching result" };
+    return {
+      ok: false,
+      message:
+        e instanceof RequestTimeoutError
+          ? requestFailureMessage(
+              e,
+              "downloading the result",
+              "Async result download",
+            )
+          : "Server not reachable while fetching result",
+    };
   }
-  return parseConvertResponse(resultResp);
 }
 
 /** Dispatch to sync or async transport based on the useAsyncEndpoint pref. */
@@ -620,6 +741,11 @@ async function convertAttachmentInner(
   ) {
     return { status: "skipped", reason: "Markdown attachment already exists" };
   }
+
+  // Re-convert: remember the current .md now, but leave it in place until the
+  // replacement is attached — a failed conversion must not cost the user
+  // their existing markdown (audit H3).
+  const previousMd = force ? findMatchingMdChild(parentItemID, filename) : null;
 
   // --- 4. Read bytes ---
   let pdfBytes: Uint8Array;
@@ -708,7 +834,7 @@ async function convertAttachmentInner(
   // Per-item subdir keeps the expected filename (paper.md) so the Zotero
   // attachment's attachmentFilename matches what hasMarkdownChild expects on
   // subsequent skipIfExists checks.
-  const mdName = filename.replace(/\.pdf$/i, ".md");
+  const mdName = mdNameForPdf(filename);
   const tmpDir = PathUtils.join(PathUtils.tempDir, `zd-${item.key}`);
   const tmpPath = PathUtils.join(tmpDir, mdName);
   try {
@@ -755,12 +881,24 @@ async function convertAttachmentInner(
       );
     }
     attachmentID = newAttachment.id;
+
+    if (previousMd && previousMd.id !== newAttachment.id) {
+      try {
+        await trashItem(previousMd);
+      } catch (e) {
+        // The new .md is attached; a leftover old copy is untidy, not lost.
+        Zotero.debug(
+          `${LOG} trashing previous .md failed (non-fatal): ${(e as Error).message}`,
+        );
+      }
+    }
   }
 
   // --- 11. Export to filesystem folder (if configured) ---
   // Naming: citationKey when set on the parent (BBT), else parent's Zotero key.
   // Two PDFs under one parent will produce the same export filename — last
   // write wins. Documented in the README.
+  let exportWarning: string | undefined;
   if (exportFolder) {
     try {
       await IOUtils.makeDirectory(exportFolder, { ignoreExisting: true });
@@ -769,11 +907,16 @@ async function convertAttachmentInner(
       await IOUtils.writeUTF8(exportPath, markdown);
       log(`exported ${exportPath}`);
     } catch (e) {
-      // Don't fail the whole conversion if export fails — the Zotero
-      // attachment (if requested) already landed.
-      Zotero.debug(
-        `${LOG} export to folder failed (non-fatal): ${(e as Error).message}`,
-      );
+      const message = `Failed to write to export folder: ${(e as Error).message}`;
+      Zotero.debug(`${LOG} ${message}`);
+      // If the export folder was the only output, the conversion produced
+      // nothing the user can reach — that's a failure, not a success
+      // (audit M5). If the .md was attached, succeed but say so.
+      if (!attachToItem) {
+        await IOUtils.remove(tmpDir, { recursive: true }).catch(() => {});
+        return { status: "error", message };
+      }
+      exportWarning = message;
     }
   }
 
@@ -790,6 +933,7 @@ async function convertAttachmentInner(
       typeof data.processing_time === "number"
         ? data.processing_time
         : undefined,
+    warning: exportWarning,
   };
 }
 
@@ -885,20 +1029,33 @@ export async function testServerConnection(
     return { ok: false, message: (e as Error).message };
   }
   try {
-    const r = await api.fetch(`${url}/health`, {
-      method: "GET",
-      headers: buildAuthHeader(),
-    });
-    if (!r.ok) return { ok: false, message: `HTTP ${r.status}` };
-    const body = await r.json().catch(() => ({}) as { status?: string });
-    if ((body as { status?: string }).status === "ok") {
-      return { ok: true, serverUrl: url };
-    }
-    return {
-      ok: false,
-      message: `Unexpected /health body: ${JSON.stringify(body)}`,
-    };
+    return await withRequestTimeout(
+      timeoutMs("healthTimeoutSec", 30),
+      async (signal) => {
+        const r = await api.fetch(`${url}/health`, {
+          method: "GET",
+          headers: buildAuthHeader(),
+          signal,
+        });
+        if (!r.ok) return { ok: false as const, message: `HTTP ${r.status}` };
+        const body = await r.json().catch(() => ({}) as { status?: string });
+        if ((body as { status?: string }).status === "ok") {
+          return { ok: true as const, serverUrl: url };
+        }
+        return {
+          ok: false as const,
+          message: `Unexpected /health body: ${JSON.stringify(body)}`,
+        };
+      },
+      api.AbortController,
+    );
   } catch (e) {
+    if (e instanceof RequestTimeoutError) {
+      return {
+        ok: false,
+        message: `${e.message} waiting for /health (Settings → Advanced → Timeouts → Connection check)`,
+      };
+    }
     return { ok: false, message: (e as Error).message };
   }
 }
